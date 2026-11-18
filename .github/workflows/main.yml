@@ -1,0 +1,197 @@
+name: Build Droidian for Xiaomi Redmi Note 8 (ginkgo)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+
+jobs:
+  build-kernel-and-rootfs:
+    name: Build Ginkgo Droidian Image (Android 11 / API 30)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space on Runner
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Setup Multiarch QEMU & Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev gpg apt-utils qemu-user-static android-sdk-platform-tools
+          sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: Setup Kernel Tree & Droidian Packaging
+        run: |
+          mkdir -p workspace/kernel workspace/packages
+          cd workspace/kernel
+          git clone --depth 1 https://github.com/David112x/droidian_kernel_xiaomi_ginkgo.git -b halium-10.0 xiaomi-ginkgo
+          cd xiaomi-ginkgo
+          git checkout -b droidian
+
+          # Setup skeleton packaging
+          mkdir -p debian/source
+          echo 13 > debian/compat
+          echo "3.0 (native)" > debian/source/format
+
+          # Create debian/kernel-info.mk
+          cat << 'EOF' > debian/kernel-info.mk
+          KERNEL_ARCH = arm64
+          DEB_BUILD_FOR = arm64
+          KERNEL_BASE_VERSION = 4.14.280
+          KERNEL_DEFCONFIG = vendor/ginkgo-perf_defconfig
+
+          # Qualcomm SM6125 Ginkgo Offsets
+          KERNEL_BOOTIMAGE_PAGE_SIZE = 4096
+          KERNEL_BOOTIMAGE_BASE_OFFSET = 0x00000000
+          KERNEL_BOOTIMAGE_KERNEL_OFFSET = 0x00008000
+          KERNEL_BOOTIMAGE_INITRAMFS_OFFSET = 0x01000000
+          KERNEL_BOOTIMAGE_TAGS_OFFSET = 0x00000100
+          KERNEL_BOOTIMAGE_VERSION = 1
+
+          # Cmdline
+          KERNEL_BOOTIMAGE_CMDLINE = console=tty0 droidian.lvm.prefer datapart=/dev/block/mmcblk0p87 earlycon=msm_geni_serial,0x4a90000 androidboot.hardware=qcom androidboot.console=ttyMSM0 user_debug=31 loop.max_part=7
+
+          # Toolchain
+          DEB_TOOLCHAIN = clang-android-10.0-r370808
+          BUILD_PATH = /usr/lib/llvm-android-10.0-r370808/bin
+          BUILD_CC = clang
+
+          # Flash info
+          FLASH_ENABLED = 1
+          FLASH_IS_LEGACY_DEVICE = 1
+          FLASH_INFO_MANUFACTURER = Xiaomi
+          FLASH_INFO_MODEL = Redmi Note 8
+          FLASH_INFO_CPU = Qualcomm Technologies, Inc SM6125
+          EOF
+
+          # Create debian/rules
+          cat << 'EOF' > debian/rules
+          #!/usr/bin/make -f
+          include /usr/share/linux-packaging-snippets/kernel-snippet.mk
+
+          %:
+          	dh $@
+
+          override_dh_dwz:
+          override_dh_strip:
+          EOF
+          chmod +x debian/rules
+
+      - name: Compile Kernel deb Packages via Docker
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/workspace/packages:/buildd \
+            -v ${{ github.workspace }}/workspace/kernel/xiaomi-ginkgo:/buildd/sources \
+            quay.io/droidian/build-essential:current-amd64 bash -c '
+              set -ex
+              apt-get update
+              apt-get install -y linux-packaging-snippets device-tree-compiler
+              cd /buildd/sources
+              rm -f debian/control
+              debian/rules debian/control
+              RELENG_HOST_ARCH="arm64" releng-build-package
+            '
+
+      - name: Extract boot.img
+        run: |
+          mkdir -p ${{ github.workspace }}/output
+          cd workspace/packages
+          dpkg-deb -x $(ls linux-bootimage-*.deb | head -n1) /tmp/extracted_boot
+          cp /tmp/extracted_boot/usr/share/kernel/boot.img ${{ github.workspace }}/output/boot.img
+          cp *.deb ${{ github.workspace }}/output/
+
+      - name: Build Adaptation Package (with sudo password akis1234)
+        run: |
+          cd ${{ github.workspace }}/workspace
+          git clone https://github.com/droidian-releng/droidian-build-tools.git
+          cd droidian-build-tools/bin
+          ./droidian-new-device -v xiaomi -n ginkgo -c arm64 -a 30 -r phone -d droidian
+
+          ADAPT_DIR="droidian/xiaomi/ginkgo/packages/adaptation-xiaomi-ginkgo"
+
+          # 1. Phosh config (Scaling for 1080x2340 FHD+)
+          mkdir -p $ADAPT_DIR/sparse/etc/phosh
+          cat << 'EOF' > $ADAPT_DIR/sparse/etc/phosh/phoc.ini
+          [output:HWCOMPOSER-1]
+          scale = 2
+          EOF
+
+          # 2. Ginkgo Screen Brightness fix
+          mkdir -p $ADAPT_DIR/sparse/etc/systemd/system
+          cat << 'EOF' > $ADAPT_DIR/sparse/etc/systemd/system/brightness.service
+          [Unit]
+          Description=Ginkgo Screen Brightness Fix
+          After=phosh.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/sh -c 'echo 2047 > /sys/class/leds/lcd-backlight/brightness'
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # 3. Automatic Password Setup (Sets droidian & root password to akis1234)
+          cat << 'EOF' > $ADAPT_DIR/sparse/etc/systemd/system/droidian-user-setup.service
+          [Unit]
+          Description=Configure Sudo and User Credentials
+          Before=display-manager.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/sh -c 'id -u droidian &>/dev/null && echo "droidian:akis1234" | chpasswd && echo "root:akis1234" | chpasswd'
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # 4. Postinst hook
+          mkdir -p $ADAPT_DIR/debian
+          cat << 'EOF' >> $ADAPT_DIR/debian/adaptation-xiaomi-ginkgo-configs.postinst
+          #!/bin/sh
+          systemctl enable brightness.service
+          systemctl enable droidian-user-setup.service
+          EOF
+          chmod +x $ADAPT_DIR/debian/adaptation-xiaomi-ginkgo-configs.postinst
+
+          # Build package
+          ${{ github.workspace }}/workspace/droidian-build-tools/bin/droidian-build-package
+
+          find . -name "*.deb" -exec cp {} ${{ github.workspace }}/output/ \;
+
+      - name: Build Droidian API 30 Rootfs
+        run: |
+          cd ${{ github.workspace }}/workspace/droidian-build-tools/bin/droidian/xiaomi/ginkgo/droidian
+          mkdir -p images
+
+          docker run --privileged \
+            -v $PWD/images:/buildd/out \
+            -v /dev:/host-dev \
+            -v /sys/fs/cgroup:/sys/fs/cgroup \
+            -v $PWD:/buildd/sources \
+            --security-opt seccomp:unconfined \
+            --cgroupns host \
+            quay.io/droidian/rootfs-builder:current-amd64 /bin/sh -c '
+              cd /buildd/sources
+              DROIDIAN_VERSION="next" ./generate_device_recipe.py xiaomi_ginkgo arm64 phosh phone 30
+              debos --disable-fakemachine generated/droidian.yaml
+            '
+
+          cp images/* ${{ github.workspace }}/output/ || true
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: droidian-ginkgo-android11-build
+          path: ${{ github.workspace }}/output/*
