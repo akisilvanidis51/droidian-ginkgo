@@ -16,6 +16,14 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Free Disk Space on Runner
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h
+
       - name: Setup Multiarch QEMU & Dependencies
         run: |
           sudo apt-get update
@@ -32,7 +40,7 @@ jobs:
 
           # Setup Debian packaging skeleton
           mkdir -p debian/source
-          echo 13 > debian/compat
+          rm -f debian/compat
           echo "3.0 (native)" > debian/source/format
 
           # Create debian/changelog
@@ -117,6 +125,7 @@ jobs:
               apt-get update
               apt-get install -y linux-packaging-snippets device-tree-compiler
               cd /buildd/sources
+              rm -f debian/compat
               rm -f debian/control
               debian/rules debian/control
               cat debian/control
